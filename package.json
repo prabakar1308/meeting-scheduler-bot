@@ -1,0 +1,25 @@
+{
+  "name": "meeting-scheduler-bot",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "@azure/msal-node": "^3.8.1",
+    "@microsoft/microsoft-graph-client": "^3.0.7",
+    "axios": "^1.13.2",
+    "botbuilder": "^4.23.3",
+    "botbuilder-dialogs": "^4.23.3",
+    "dotenv": "^17.2.3",
+    "express": "^5.1.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.10"
+  }
+}
