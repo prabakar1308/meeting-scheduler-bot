@@ -66,33 +66,58 @@ setInterval(() => {
 }, 5 * 60 * 1000); // Run every 5 minutes
 
 // Bot messaging endpoint
-app.post("/api/messages", async (req, res) => {
-  const fromName = req.body.from?.name || "Unknown User";
-  const messageText = req.body.text || "[No text]";
+// app.post("/api/messages", async (req, res) => {
+//   const fromName = req.body.from?.name || "Unknown User";
+//   const messageText = req.body.text || "[No text]";
 
-  console.log(
-    `\n📨 Message from ${fromName}: ${messageText.substring(0, 50)}${
-      messageText.length > 50 ? "..." : ""
-    }`
-  );
+//   console.log(
+//     `\n📨 Message from ${fromName}: ${messageText.substring(0, 50)}${
+//       messageText.length > 50 ? "..." : ""
+//     }`
+//   );
+
+//   try {
+//     await adapter.process(req, res, async (context) => {
+//       // Store OAuth state for this conversation
+//       if (context.activity.from && context.activity.conversation) {
+//         const state = `${context.activity.from.id}_${Date.now()}`;
+//         oauthStateStore.set(state, {
+//           userId: context.activity.from.id,
+//           conversationId: context.activity.conversation.id,
+//           serviceUrl: context.activity.serviceUrl,
+//           timestamp: Date.now(),
+//         });
+//       }
+
+//       await bot.run(context);
+//     });
+//   } catch (error) {
+//     console.error("❌ Error processing message:", error);
+//     if (!res.headersSent) {
+//       res.status(500).json({
+//         error: "Internal server error",
+//         message: error.message,
+//       });
+//     }
+//   }
+// });
+
+// Main bot endpoint
+app.post("/api/messages", async (req, res) => {
+  console.log("\n" + "=".repeat(60));
+  console.log("📨 Incoming Request");
+  console.log("   From:", req.body.from?.name || "Unknown");
+  console.log("   Type:", req.body.type);
 
   try {
     await adapter.process(req, res, async (context) => {
-      // Store OAuth state for this conversation
-      if (context.activity.from && context.activity.conversation) {
-        const state = `${context.activity.from.id}_${Date.now()}`;
-        oauthStateStore.set(state, {
-          userId: context.activity.from.id,
-          conversationId: context.activity.conversation.id,
-          serviceUrl: context.activity.serviceUrl,
-          timestamp: Date.now(),
-        });
-      }
-
       await bot.run(context);
     });
   } catch (error) {
-    console.error("❌ Error processing message:", error);
+    console.error("\n❌ ERROR in /api/messages:");
+    console.error("   Message:", error.message);
+    console.error("   Stack:", error.stack);
+
     if (!res.headersSent) {
       res.status(500).json({
         error: "Internal server error",
