@@ -236,7 +236,19 @@ app.get("/health", (req, res) => {
 
 // Root endpoint with documentation
 app.get("/", (req, res) => {
-  res.send(generateHomePage());
+  res.send(
+    generateErrorPage(
+      "Welcome to the Meeting Scheduler Bot API",
+      `
+    Available Endpoints:
+    - POST /api/messages : Bot message endpoint
+    - GET /api/oauth/callback : OAuth callback endpoint
+    - POST /api/oauth/exchange : Token exchange endpoint
+    - GET /api/oauth/test : OAuth test endpoint
+    - GET /health : Health check endpoint
+  `
+    )
+  );
 });
 
 // Test endpoint to verify OAuth URL generation
