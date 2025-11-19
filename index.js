@@ -1,5 +1,7 @@
 require("dotenv").config();
 const express = require("express");
+const crypto = require("crypto");
+const axios = require("axios");
 const {
   CloudAdapter,
   MemoryStorage,
@@ -7,9 +9,10 @@ const {
   UserState,
   ConfigurationServiceClientCredentialFactory,
   createBotFrameworkAuthenticationFromConfiguration,
+  MessageFactory,
+  ActionTypes,
 } = require("botbuilder");
-const { MeetingSchedulerBot } = require("./bot");
-const { AuthService } = require("./services/authService");
+const { Client } = require("@microsoft/microsoft-graph-client");
 
 const app = express();
 app.use(express.json());
@@ -17,730 +20,591 @@ app.use(express.urlencoded({ extended: true }));
 
 const PORT = process.env.PORT || 3978;
 
-// Create ConfigurationServiceClientCredentialFactory
+// ============================================================================
+// OAUTH CONFIGURATION
+// ============================================================================
+
+const MICROSOFT_APP_ID = process.env.MICROSOFT_APP_ID;
+const MICROSOFT_APP_PASSWORD = process.env.MICROSOFT_APP_PASSWORD;
+const TENANT_ID = process.env.TENANT_ID || "common";
+
+const BASE_URL =
+  process.env.BASE_URL || "https://meeting-scheduler-bot-i5oj.onrender.com";
+const REDIRECT_URI = `${BASE_URL}/api/oauth/callback`;
+
+const SCOPES = "User.Read Calendars.ReadWrite offline_access";
+
+console.log("\n🔧 OAuth Configuration:");
+console.log("   App ID:", MICROSOFT_APP_ID ? "✓ Configured" : "✗ MISSING");
+console.log(
+  "   App Password:",
+  MICROSOFT_APP_PASSWORD ? "✓ Configured" : "✗ MISSING"
+);
+console.log("   Tenant ID:", TENANT_ID);
+console.log("   Redirect URI:", REDIRECT_URI);
+
+// ============================================================================
+// BOT FRAMEWORK SETUP
+// ============================================================================
+
 const credentialsFactory = new ConfigurationServiceClientCredentialFactory({
-  MicrosoftAppId: process.env.MICROSOFT_APP_ID,
-  MicrosoftAppPassword: process.env.MICROSOFT_APP_PASSWORD,
+  MicrosoftAppId: MICROSOFT_APP_ID,
+  MicrosoftAppPassword: MICROSOFT_APP_PASSWORD,
+  MicrosoftAppType: "MultiTenant",
 });
 
-// Create BotFrameworkAuthentication instance
 const botFrameworkAuthentication =
   createBotFrameworkAuthenticationFromConfiguration(null, credentialsFactory);
 
-// Update adapter to use botFrameworkAuthentication
 const adapter = new CloudAdapter(botFrameworkAuthentication);
 
-// Error handling
 adapter.onTurnError = async (context, error) => {
-  console.error(`\n [onTurnError] unhandled error: ${error}`);
-  await context.sendActivity("The bot encountered an error or bug.");
-  await context.sendActivity("Please check the console for more details.");
+  console.error(`\n❌ [Bot Error]: ${error.message}`);
+  console.error(error.stack);
 
-  // Clear conversation state to avoid stuck states
-  await conversationState.delete(context);
+  try {
+    await context.sendActivity(
+      "⚠️ Sorry, something went wrong. Please try again."
+    );
+  } catch (err) {
+    console.error("Failed to send error message:", err);
+  }
 };
 
-// Create conversation and user state
+// ============================================================================
+// STATE MANAGEMENT
+// ============================================================================
+
 const memoryStorage = new MemoryStorage();
 const conversationState = new ConversationState(memoryStorage);
 const userState = new UserState(memoryStorage);
 
-// Create auth service
-const authService = new AuthService();
+// ============================================================================
+// IN-MEMORY STORAGE
+// ============================================================================
 
-// Create the bot
-const bot = new MeetingSchedulerBot(conversationState, userState);
-
-// Store for tracking OAuth state (in production, use Redis or similar)
 const oauthStateStore = new Map();
+const tokenStore = new Map();
 
-// Clean up old OAuth states periodically (older than 10 minutes)
+// Clean up expired states
 setInterval(() => {
   const tenMinutesAgo = Date.now() - 10 * 60 * 1000;
   for (const [state, data] of oauthStateStore.entries()) {
     if (data.timestamp < tenMinutesAgo) {
       oauthStateStore.delete(state);
-      console.log(`🧹 Cleaned up expired OAuth state: ${state}`);
     }
   }
-}, 5 * 60 * 1000); // Run every 5 minutes
+}, 5 * 60 * 1000);
 
-// Bot messaging endpoint
-// app.post("/api/messages", async (req, res) => {
-//   const fromName = req.body.from?.name || "Unknown User";
-//   const messageText = req.body.text || "[No text]";
+// ============================================================================
+// OAUTH HELPER FUNCTIONS
+// ============================================================================
 
-//   console.log(
-//     `\n📨 Message from ${fromName}: ${messageText.substring(0, 50)}${
-//       messageText.length > 50 ? "..." : ""
-//     }`
-//   );
+function generateOAuthUrl(userId) {
+  const state = crypto.randomBytes(16).toString("hex");
 
-//   try {
-//     await adapter.process(req, res, async (context) => {
-//       // Store OAuth state for this conversation
-//       if (context.activity.from && context.activity.conversation) {
-//         const state = `${context.activity.from.id}_${Date.now()}`;
-//         oauthStateStore.set(state, {
-//           userId: context.activity.from.id,
-//           conversationId: context.activity.conversation.id,
-//           serviceUrl: context.activity.serviceUrl,
-//           timestamp: Date.now(),
-//         });
-//       }
+  oauthStateStore.set(state, {
+    userId,
+    timestamp: Date.now(),
+  });
 
-//       await bot.run(context);
-//     });
-//   } catch (error) {
-//     console.error("❌ Error processing message:", error);
-//     if (!res.headersSent) {
-//       res.status(500).json({
-//         error: "Internal server error",
-//         message: error.message,
-//       });
-//     }
-//   }
-// });
+  const authUrl =
+    `https://login.microsoftonline.com/${TENANT_ID}/oauth2/v2.0/authorize?` +
+    `client_id=${encodeURIComponent(MICROSOFT_APP_ID)}` +
+    `&response_type=code` +
+    `&redirect_uri=${encodeURIComponent(REDIRECT_URI)}` +
+    `&response_mode=query` +
+    `&scope=${encodeURIComponent(SCOPES)}` +
+    `&state=${state}` +
+    `&prompt=select_account`;
 
-// Main bot endpoint
+  console.log(`🔗 Generated OAuth URL for user: ${userId}`);
+  return authUrl;
+}
+
+async function exchangeCodeForToken(code) {
+  try {
+    const tokenUrl = `https://login.microsoftonline.com/${TENANT_ID}/oauth2/v2.0/token`;
+
+    const params = new URLSearchParams();
+    params.append("client_id", MICROSOFT_APP_ID);
+    params.append("scope", SCOPES);
+    params.append("code", code);
+    params.append("redirect_uri", REDIRECT_URI);
+    params.append("grant_type", "authorization_code");
+    params.append("client_secret", MICROSOFT_APP_PASSWORD);
+
+    console.log("🔄 Exchanging authorization code for token...");
+
+    const response = await axios.post(tokenUrl, params, {
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    });
+
+    console.log("✅ Token exchange successful");
+    return response.data;
+  } catch (error) {
+    console.error("❌ Token exchange error:");
+    console.error("   Status:", error.response?.status);
+    console.error("   Data:", error.response?.data);
+    throw error;
+  }
+}
+
+async function getValidToken(userId) {
+  const tokenData = tokenStore.get(userId);
+
+  if (!tokenData) {
+    return null;
+  }
+
+  const now = Date.now();
+  const expiresAt = tokenData.expires_at || 0;
+
+  if (now >= expiresAt - 5 * 60 * 1000) {
+    // Token expired
+    tokenStore.delete(userId);
+    return null;
+  }
+
+  return tokenData.access_token;
+}
+
+function getGraphClient(accessToken) {
+  return Client.init({
+    authProvider: (done) => {
+      done(null, accessToken);
+    },
+  });
+}
+
+// ============================================================================
+// BOT CLASS
+// ============================================================================
+
+class MeetingSchedulerBot {
+  constructor(conversationState, userState) {
+    this.conversationState = conversationState;
+    this.userState = userState;
+    this.conversationData =
+      conversationState.createProperty("conversationData");
+    this.userData = userState.createProperty("userData");
+  }
+
+  async run(context) {
+    await this.onTurn(context);
+    await this.conversationState.saveChanges(context, false);
+    await this.userState.saveChanges(context, false);
+  }
+
+  async onTurn(context) {
+    const activityType = context.activity.type;
+
+    if (activityType === "message") {
+      await this.handleMessage(context);
+    } else if (activityType === "conversationUpdate") {
+      await this.handleConversationUpdate(context);
+    }
+  }
+
+  async handleMessage(context) {
+    const text = (context.activity.text || "").toLowerCase().trim();
+    const userId = context.activity.from.id;
+    const userName = context.activity.from.name || "User";
+
+    console.log(`\n📩 Message from ${userName}: "${context.activity.text}"`);
+
+    // Check authentication
+    const accessToken = await getValidToken(userId);
+    const isAuthenticated = !!accessToken;
+
+    console.log(`   Authentication: ${isAuthenticated ? "✅ Yes" : "❌ No"}`);
+
+    // Handle unauthenticated users
+    if (!isAuthenticated) {
+      if (
+        text.includes("login") ||
+        text.includes("signin") ||
+        text.includes("start") ||
+        text.includes("hello") ||
+        text.includes("hi")
+      ) {
+        await this.sendSignInMessage(context, userId);
+      } else {
+        await context.sendActivity(
+          "👋 **Welcome to Meeting Scheduler Bot!**\n\n" +
+            "To get started, please sign in to your Microsoft account.\n\n" +
+            "Type **login** to continue."
+        );
+      }
+      return;
+    }
+
+    // Handle authenticated commands
+    if (
+      text.includes("calendar") ||
+      text.includes("events") ||
+      text.includes("list")
+    ) {
+      await this.listCalendarEvents(context, userId, accessToken);
+    } else if (
+      text.includes("profile") ||
+      text.includes("me") ||
+      text.includes("whoami")
+    ) {
+      await this.showUserProfile(context, userId, accessToken);
+    } else if (text.includes("logout") || text.includes("signout")) {
+      await this.logout(context, userId);
+    } else if (text.includes("help")) {
+      await this.sendHelpMessage(context, true);
+    } else {
+      await context.sendActivity(
+        `You said: "${context.activity.text}"\n\n` +
+          "**Available commands:**\n" +
+          "• `calendar` - View your calendar\n" +
+          "• `profile` - Show your profile\n" +
+          "• `logout` - Sign out\n" +
+          "• `help` - Show help"
+      );
+    }
+
+    console.log("   ✅ Response sent");
+  }
+
+  async handleConversationUpdate(context) {
+    if (context.activity.membersAdded) {
+      for (const member of context.activity.membersAdded) {
+        if (member.id !== context.activity.recipient.id) {
+          console.log(`   👤 New member: ${member.name || member.id}`);
+
+          await context.sendActivity(
+            "👋 **Welcome to Meeting Scheduler Bot!**\n\n" +
+              "I can help you manage your Microsoft Calendar.\n\n" +
+              "Type **login** to get started!"
+          );
+        }
+      }
+    }
+  }
+
+  async sendSignInMessage(context, userId) {
+    const authUrl = generateOAuthUrl(userId);
+
+    // Create a simple message with a link instead of a signin card
+    const message = MessageFactory.text(
+      `🔐 **Please sign in to continue**\n\n` +
+        `Click here to sign in: [Sign in to Microsoft](${authUrl})\n\n` +
+        `After signing in, close the browser window and return here.`
+    );
+
+    await context.sendActivity(message);
+    console.log("   🔐 Sign-in link sent");
+  }
+
+  async sendHelpMessage(context, isAuthenticated) {
+    let helpText = "**📚 Meeting Scheduler Bot - Help**\n\n";
+
+    if (isAuthenticated) {
+      helpText +=
+        "**📅 Available Commands:**\n" +
+        "• `calendar` or `events` - View your upcoming calendar events\n" +
+        "• `profile` or `me` - Show your profile information\n" +
+        "• `logout` - Sign out from your account\n";
+    } else {
+      helpText +=
+        "**🔐 Getting Started:**\n" +
+        "• `login` - Sign in to your Microsoft account\n\n" +
+        "Once signed in, you can manage your calendar!";
+    }
+
+    await context.sendActivity(helpText);
+  }
+
+  async showUserProfile(context, userId, accessToken) {
+    try {
+      const client = getGraphClient(accessToken);
+      await context.sendActivity("🔍 Fetching your profile...");
+
+      const user = await client.api("/me").get();
+
+      const profileText =
+        `👤 **Your Profile**\n\n` +
+        `**Name:** ${user.displayName || "N/A"}\n` +
+        `**Email:** ${user.mail || user.userPrincipalName || "N/A"}\n` +
+        `**Job Title:** ${user.jobTitle || "N/A"}\n` +
+        `**Office:** ${user.officeLocation || "N/A"}`;
+
+      await context.sendActivity(profileText);
+      console.log("   ✅ Profile displayed");
+    } catch (error) {
+      console.error("❌ Error fetching profile:", error);
+      await this.handleGraphError(context, userId, error);
+    }
+  }
+
+  async listCalendarEvents(context, userId, accessToken) {
+    try {
+      const client = getGraphClient(accessToken);
+      await context.sendActivity("🔍 Fetching your calendar events...");
+
+      const events = await client
+        .api("/me/calendar/events")
+        .top(10)
+        .select("subject,start,end,organizer,location")
+        .filter(`start/dateTime ge '${new Date().toISOString()}'`)
+        .orderby("start/dateTime")
+        .get();
+
+      if (events.value.length === 0) {
+        await context.sendActivity("📅 You have no upcoming events.");
+        return;
+      }
+
+      let message = `📅 **Your Upcoming Events (${events.value.length}):**\n\n`;
+
+      events.value.forEach((event, index) => {
+        const startDate = new Date(event.start.dateTime);
+        const endDate = new Date(event.end.dateTime);
+        const duration = Math.round((endDate - startDate) / 60000);
+
+        message += `**${index + 1}. ${event.subject}**\n`;
+        message += `   📅 ${startDate.toLocaleDateString()} at ${startDate.toLocaleTimeString(
+          [],
+          { hour: "2-digit", minute: "2-digit" }
+        )}\n`;
+        message += `   ⏱️ ${duration} minutes\n`;
+
+        if (event.location?.displayName) {
+          message += `   📍 ${event.location.displayName}\n`;
+        }
+
+        message += "\n";
+      });
+
+      await context.sendActivity(message);
+      console.log("   ✅ Calendar events sent");
+    } catch (error) {
+      console.error("❌ Error fetching calendar:", error);
+      await this.handleGraphError(context, userId, error);
+    }
+  }
+
+  async logout(context, userId) {
+    tokenStore.delete(userId);
+
+    await context.sendActivity(
+      "✅ **Signed Out Successfully**\n\n" +
+        "You've been signed out. Type **login** to sign in again."
+    );
+
+    console.log(`   🔓 User signed out`);
+  }
+
+  async handleGraphError(context, userId, error) {
+    if (
+      error.statusCode === 401 ||
+      error.code === "InvalidAuthenticationToken"
+    ) {
+      tokenStore.delete(userId);
+      await context.sendActivity(
+        "⚠️ Your session has expired. Please type **login** to sign in again."
+      );
+    } else {
+      await context.sendActivity(
+        "❌ Sorry, I encountered an error. Please try again later."
+      );
+    }
+  }
+}
+
+const bot = new MeetingSchedulerBot(conversationState, userState);
+
+// ============================================================================
+// API ENDPOINTS
+// ============================================================================
+
 app.post("/api/messages", async (req, res) => {
-  console.log("\n" + "=".repeat(60));
-  console.log("📨 Incoming Request");
-  console.log("   From:", req.body.from?.name || "Unknown");
-  console.log("   Type:", req.body.type);
+  console.log("\n📨 Incoming message");
 
   try {
     await adapter.process(req, res, async (context) => {
       await bot.run(context);
     });
   } catch (error) {
-    console.error("\n❌ ERROR in /api/messages:");
-    console.error("   Message:", error.message);
-    console.error("   Stack:", error.stack);
-
+    console.error("❌ Error in /api/messages:", error);
     if (!res.headersSent) {
-      res.status(500).json({
-        error: "Internal server error",
-        message: error.message,
-      });
+      res.status(500).json({ error: error.message });
     }
   }
 });
 
-// OAuth callback endpoint
 app.get("/api/oauth/callback", async (req, res) => {
-  const code = req.query.code;
-  const error = req.query.error;
-  const state = req.query.state;
-  const errorDescription = req.query.error_description;
+  console.log("\n🔐 OAuth callback received");
 
-  console.log("\n🔐 OAuth Callback Received");
-  console.log(
-    `   Code: ${code ? "✓ Present (" + code.length + " chars)" : "✗ Missing"}`
-  );
-  console.log(`   State: ${state || "None"}`);
-  console.log(`   Error: ${error || "None"}`);
+  const { code, state, error, error_description } = req.query;
 
-  // Handle OAuth error
   if (error) {
-    console.error(`❌ OAuth Error: ${error} - ${errorDescription}`);
-    return res.status(400).send(generateErrorPage(error, errorDescription));
+    console.error("❌ OAuth error:", error, error_description);
+    return res.send(generateErrorPage(error_description || error));
   }
 
-  // Validate authorization code
-  if (!code) {
-    console.error("❌ No authorization code received");
-    return res
-      .status(400)
-      .send(
-        generateErrorPage(
-          "missing_code",
-          "No authorization code was received from Microsoft"
-        )
-      );
+  const stateData = oauthStateStore.get(state);
+  if (!stateData) {
+    console.error("❌ Invalid or expired OAuth state");
+    return res.send(
+      generateErrorPage("Invalid or expired session. Please try again.")
+    );
   }
 
-  // Retrieve OAuth state data
-  const stateData = state ? oauthStateStore.get(state) : null;
+  try {
+    const tokenData = await exchangeCodeForToken(code);
 
-  if (stateData) {
-    console.log(`✅ Found OAuth state for user: ${stateData.userId}`);
-    // Clean up used state
+    const now = Date.now();
+    tokenStore.set(stateData.userId, {
+      access_token: tokenData.access_token,
+      refresh_token: tokenData.refresh_token,
+      expires_at: now + tokenData.expires_in * 1000,
+    });
+
+    console.log("✅ Token stored for user:", stateData.userId);
     oauthStateStore.delete(state);
-  } else {
-    console.warn("⚠️  OAuth state not found or expired");
-  }
 
-  // Return success page with code for user to paste
-  console.log("✅ Authorization successful, displaying code to user");
-  res.send(generateSuccessPage(code, state));
-});
-
-// Token exchange endpoint (for proactive authentication completion)
-app.post("/api/oauth/exchange", async (req, res) => {
-  const { code, userId } = req.body;
-
-  console.log(`\n🔄 Token exchange requested for user: ${userId}`);
-
-  if (!code) {
-    return res.status(400).json({
-      success: false,
-      error: "Authorization code is required",
-    });
-  }
-
-  try {
-    // Exchange code for tokens
-    const tokens = await authService.acquireTokenByCode(code);
-
-    console.log("✅ Tokens acquired successfully");
-
-    // In production, you would:
-    // 1. Store tokens securely (encrypted in database)
-    // 2. Associate with user ID
-    // 3. Send proactive message to user confirming auth
-
-    res.json({
-      success: true,
-      message: "Authentication completed successfully",
-      expiresOn: tokens.expiresOn,
-    });
+    res.send(generateSuccessPage());
   } catch (error) {
-    console.error("❌ Token exchange failed:", error.message);
-    res.status(500).json({
-      success: false,
-      error: error.message,
-    });
+    console.error("❌ Token exchange failed:", error);
+    res.send(
+      generateErrorPage("Failed to complete sign-in. Please try again.")
+    );
   }
 });
 
-// Health check endpoint
-app.get("/health", (req, res) => {
-  const health = {
-    status: "healthy",
-    timestamp: new Date().toISOString(),
-    uptime: process.uptime(),
-    environment: {
-      nodeVersion: process.version,
-      port: PORT,
-      oauthConfigured: !!process.env.MICROSOFT_APP_ID,
-    },
-    oauth: {
-      clientId: process.env.MICROSOFT_APP_ID ? "configured" : "not configured",
-      redirectUri: process.env.OAUTH_REDIRECT_URI || "not configured",
-    },
-  };
-
-  res.json(health);
-});
-
-// Root endpoint with documentation
 app.get("/", (req, res) => {
-  res.send(
-    generateErrorPage(
-      "Welcome to the Meeting Scheduler Bot API",
-      `
-    Available Endpoints:
-    - POST /api/messages : Bot message endpoint
-    - GET /api/oauth/callback : OAuth callback endpoint
-    - POST /api/oauth/exchange : Token exchange endpoint
-    - GET /api/oauth/test : OAuth test endpoint
-    - GET /health : Health check endpoint
-  `
-    )
-  );
-});
-
-// Test endpoint to verify OAuth URL generation
-app.get("/api/oauth/test", async (req, res) => {
-  try {
-    const testState = "test_" + Date.now();
-    const authUrl = await authService.getAuthCodeUrl(testState);
-    res.json({
-      success: true,
-      authUrl: authUrl,
-      state: testState,
-      message:
-        "OAuth URL generated successfully. Use this to test authentication flow.",
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      error: error.message,
-      message: "Failed to generate OAuth URL. Check your configuration.",
-    });
-  }
-});
-
-// 404 handler
-app.use((req, res) => {
-  res.status(404).json({
-    error: "Not Found",
-    message: `Route ${req.method} ${req.path} not found`,
-    availableEndpoints: [
-      "POST /api/messages",
-      "GET /api/oauth/callback",
-      "POST /api/oauth/exchange",
-      "GET /api/oauth/test",
-      "GET /health",
-      "GET /",
-    ],
+  res.json({
+    status: "✅ Bot is running",
+    timestamp: new Date().toISOString(),
   });
 });
 
-// Error handling middleware
-app.use((error, req, res, next) => {
-  console.error("Express error:", error);
-  res.status(500).json({
-    error: "Internal Server Error",
-    message: error.message,
+app.get("/health", (req, res) => {
+  res.json({
+    status: "healthy",
+    uptime: process.uptime(),
   });
 });
 
-// Start server
-const server = app.listen(PORT, () => {
-  console.log("\n" + "═".repeat(70));
-  console.log("  🤖 MEETING SCHEDULER BOT - PRODUCTION SERVER");
-  console.log("═".repeat(70));
-  console.log("\n📊 Server Information:");
-  console.log(`   Port: ${PORT}`);
-  console.log(`   Environment: ${process.env.NODE_ENV || "development"}`);
-  console.log(`   Node Version: ${process.version}`);
+// ============================================================================
+// HTML GENERATORS
+// ============================================================================
 
-  console.log("\n🔗 Endpoints:");
-  console.log(`   Bot Messages:    http://localhost:${PORT}/api/messages`);
-  console.log(
-    `   OAuth Callback:  http://localhost:${PORT}/api/oauth/callback`
-  );
-  console.log(`   Health Check:    http://localhost:${PORT}/health`);
-  console.log(`   Documentation:   http://localhost:${PORT}`);
-
-  console.log("\n🔐 OAuth Configuration:");
-  if (process.env.MICROSOFT_APP_ID) {
-    console.log(
-      `   ✅ Client ID: ${process.env.MICROSOFT_APP_ID.substring(0, 8)}...`
-    );
-    console.log(`   ✅ Client Secret: ${"*".repeat(20)}`);
-    console.log(`   ✅ Redirect URI: ${process.env.OAUTH_REDIRECT_URI}`);
-  } else {
-    console.log(
-      "   ⚠️  OAuth not configured (set MICROSOFT_APP_ID and MICROSOFT_APP_PASSWORD)"
-    );
-  }
-
-  console.log("\n📱 Bot Framework Emulator Setup:");
-  console.log("   1. Open Bot Framework Emulator");
-  console.log('   2. Click "Open Bot"');
-  console.log(`   3. Bot URL: http://localhost:${PORT}/api/messages`);
-  console.log("   4. For local testing: Leave credentials empty");
-  console.log("   5. For OAuth testing: Enter App ID and Password");
-
-  console.log("\n💡 Quick Test:");
-  console.log(`   Visit: http://localhost:${PORT}/api/oauth/test`);
-  console.log("   This will generate a test OAuth URL\n");
-
-  console.log("═".repeat(70));
-  console.log("✅ Server is ready to accept connections");
-  console.log("Press Ctrl+C to stop\n");
-});
-
-// Graceful shutdown
-process.on("SIGINT", () => {
-  console.log("\n\n🛑 Shutting down gracefully...");
-  server.close(() => {
-    console.log("✅ Server closed");
-    process.exit(0);
-  });
-});
-
-process.on("SIGTERM", () => {
-  console.log("\n\n🛑 SIGTERM received, shutting down...");
-  server.close(() => {
-    console.log("✅ Server closed");
-    process.exit(0);
-  });
-});
-
-// Handle uncaught exceptions
-process.on("uncaughtException", (error) => {
-  console.error("💥 Uncaught Exception:", error);
-  process.exit(1);
-});
-
-process.on("unhandledRejection", (reason, promise) => {
-  console.error("💥 Unhandled Rejection at:", promise, "reason:", reason);
-});
-
-// Helper function to generate error page
-function generateErrorPage(error, description) {
+function generateSuccessPage() {
   return `
-        <!DOCTYPE html>
-        <html>
-            <head>
-                <meta charset="UTF-8">
-                <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                <title>Authentication Error</title>
-                <style>
-                    body {
-                        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
-                        display: flex;
-                        justify-content: center;
-                        align-items: center;
-                        min-height: 100vh;
-                        margin: 0;
-                        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                        padding: 20px;
-                    }
-                    .container {
-                        background: white;
-                        padding: 40px;
-                        border-radius: 12px;
-                        box-shadow: 0 8px 16px rgba(0,0,0,0.2);
-                        text-align: center;
-                        max-width: 500px;
-                        width: 100%;
-                    }
-                    .error-icon {
-                        font-size: 64px;
-                        margin-bottom: 20px;
-                    }
-                    h1 {
-                        color: #d32f2f;
-                        margin: 0 0 10px 0;
-                        font-size: 24px;
-                    }
-                    .error-code {
-                        background: #ffebee;
-                        padding: 15px;
-                        border-radius: 8px;
-                        margin: 20px 0;
-                        color: #c62828;
-                        font-size: 14px;
-                        word-break: break-word;
-                    }
-                    p {
-                        color: #666;
-                        line-height: 1.6;
-                        margin: 15px 0;
-                    }
-                    button {
-                        background: #667eea;
-                        color: white;
-                        border: none;
-                        padding: 12px 30px;
-                        border-radius: 6px;
-                        cursor: pointer;
-                        font-size: 16px;
-                        margin-top: 20px;
-                        transition: background 0.3s;
-                    }
-                    button:hover {
-                        background: #5568d3;
-                    }
-                </style>
-            </head>
-            <body>
-                <div class="container">
-                    <div class="error-icon">❌</div>
-                    <h1>Authentication Failed</h1>
-                    <div class="error-code">
-                        <strong>Error:</strong> ${error}<br>
-                        ${
-                          description
-                            ? `<strong>Details:</strong> ${description}`
-                            : ""
-                        }
-                    </div>
-                    <p>Please close this window and try authenticating again in your chat.</p>
-                    <button onclick="window.close()">Close Window</button>
-                </div>
-            </body>
-        </html>
-    `;
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sign-in Successful</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      min-height: 100vh;
+      margin: 0;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    }
+    .container {
+      background: white;
+      padding: 40px;
+      border-radius: 12px;
+      box-shadow: 0 10px 40px rgba(0,0,0,0.2);
+      text-align: center;
+      max-width: 400px;
+    }
+    .icon { font-size: 64px; margin-bottom: 20px; }
+    h1 { color: #2d3748; margin: 0 0 10px 0; }
+    p { color: #4a5568; line-height: 1.6; }
+    .button {
+      background: #667eea;
+      color: white;
+      border: none;
+      padding: 12px 24px;
+      border-radius: 6px;
+      font-size: 16px;
+      cursor: pointer;
+      margin-top: 20px;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="icon">✅</div>
+    <h1>Sign-in Successful!</h1>
+    <p>You've been authenticated successfully.</p>
+    <p>Close this window and return to Microsoft Teams.</p>
+    <p><strong>Type "calendar"</strong> to see your events!</p>
+    <button class="button" onclick="window.close()">Close Window</button>
+  </div>
+  <script>setTimeout(() => window.close(), 5000);</script>
+</body>
+</html>
+  `;
 }
 
-// Helper function to generate success page
-function generateSuccessPage(code, state) {
+function generateErrorPage(errorMessage) {
   return `
-        <!DOCTYPE html>
-        <html>
-            <head>
-                <meta charset="UTF-8">
-                <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                <title>Authentication Successful</title>
-                <style>
-                    * { box-sizing: border-box; }
-                    body {
-                        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
-                        display: flex;
-                        justify-content: center;
-                        align-items: center;
-                        min-height: 100vh;
-                        margin: 0;
-                        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                        padding: 20px;
-                    }
-                    .container {
-                        background: white;
-                        padding: 40px;
-                        border-radius: 12px;
-                        box-shadow: 0 8px 16px rgba(0,0,0,0.2);
-                        text-align: center;
-                        max-width: 600px;
-                        width: 100%;
-                        animation: slideUp 0.5s ease-out;
-                    }
-                    @keyframes slideUp {
-                        from { transform: translateY(30px); opacity: 0; }
-                        to { transform: translateY(0); opacity: 1; }
-                    }
-                    .success-icon {
-                        font-size: 64px;
-                        margin-bottom: 20px;
-                        animation: scaleIn 0.6s ease-out;
-                    }
-                    @keyframes scaleIn {
-                        from { transform: scale(0); }
-                        to { transform: scale(1); }
-                    }
-                    h1 {
-                        color: #333;
-                        margin: 0 0 15px 0;
-                        font-size: 28px;
-                    }
-                    .subtitle {
-                        color: #666;
-                        margin-bottom: 30px;
-                        font-size: 16px;
-                    }
-                    .instructions {
-                        background: #e3f2fd;
-                        padding: 25px;
-                        border-radius: 8px;
-                        margin: 25px 0;
-                        text-align: left;
-                        border-left: 4px solid #2196f3;
-                    }
-                    .instructions h3 {
-                        margin: 0 0 15px 0;
-                        color: #1976d2;
-                        font-size: 18px;
-                    }
-                    .instructions ol {
-                        margin: 10px 0;
-                        padding-left: 25px;
-                    }
-                    .instructions li {
-                        margin: 10px 0;
-                        color: #424242;
-                        line-height: 1.6;
-                    }
-                    .code-container {
-                        background: #f5f5f5;
-                        padding: 20px;
-                        border-radius: 8px;
-                        margin: 25px 0;
-                        border: 2px dashed #667eea;
-                    }
-                    .code-label {
-                        font-weight: 600;
-                        color: #333;
-                        margin-bottom: 12px;
-                        font-size: 14px;
-                    }
-                    .code {
-                        font-family: 'Courier New', monospace;
-                        font-size: 14px;
-                        color: #667eea;
-                        font-weight: bold;
-                        word-break: break-all;
-                        padding: 15px;
-                        background: white;
-                        border-radius: 6px;
-                        cursor: pointer;
-                        user-select: all;
-                        transition: background 0.3s;
-                    }
-                    .code:hover {
-                        background: #f0f0f0;
-                    }
-                    .example {
-                        font-size: 13px;
-                        color: #999;
-                        margin-top: 15px;
-                        font-style: italic;
-                    }
-                    .example code {
-                        background: #f5f5f5;
-                        padding: 2px 6px;
-                        border-radius: 3px;
-                        color: #e83e8c;
-                        font-style: normal;
-                    }
-                    .btn-container {
-                        display: flex;
-                        gap: 12px;
-                        justify-content: center;
-                        margin-top: 30px;
-                        flex-wrap: wrap;
-                    }
-                    button {
-                        border: none;
-                        padding: 14px 28px;
-                        border-radius: 6px;
-                        cursor: pointer;
-                        font-size: 15px;
-                        font-weight: 500;
-                        transition: all 0.3s;
-                        min-width: 140px;
-                    }
-                    .btn-copy {
-                        background: #667eea;
-                        color: white;
-                    }
-                    .btn-copy:hover {
-                        background: #5568d3;
-                        transform: translateY(-2px);
-                        box-shadow: 0 4px 8px rgba(102, 126, 234, 0.4);
-                    }
-                    .btn-close {
-                        background: #e0e0e0;
-                        color: #333;
-                    }
-                    .btn-close:hover {
-                        background: #d0d0d0;
-                    }
-                    .success-msg {
-                        display: none;
-                        color: #4caf50;
-                        margin-top: 15px;
-                        font-weight: 600;
-                        animation: fadeIn 0.3s;
-                    }
-                    @keyframes fadeIn {
-                        from { opacity: 0; }
-                        to { opacity: 1; }
-                    }
-                    .highlight {
-                        background: #fff59d;
-                        padding: 2px 6px;
-                        border-radius: 3px;
-                        font-weight: bold;
-                        color: #f57f17;
-                    }
-                </style>
-            </head>
-            <body>
-                <div class="container">
-                    <div class="success-icon">✅</div>
-                    <h1>Authentication Successful!</h1>
-                    <p class="subtitle">Your Microsoft account has been verified</p>
-                    
-                    <div class="instructions">
-                        <h3>📋 Complete Setup (3 Steps)</h3>
-                        <ol>
-                            <li><strong>Copy the code below</strong> by clicking on it or using the "Copy Code" button</li>
-                            <li><strong>Return to your bot conversation</strong> in the emulator or chat</li>
-                            <li><strong>Send this message:</strong> <span class="highlight">auth:</span> followed by the code</li>
-                        </ol>
-                    </div>
-                    
-                    <div class="code-container">
-                        <div class="code-label">🔑 Your Authentication Code:</div>
-                        <div class="code" id="authCode" onclick="copyCode()" title="Click to select">${code}</div>
-                    </div>
-                    
-                    <div class="example">
-                        💡 Example message to send: <code>auth:${code.substring(
-                          0,
-                          30
-                        )}...</code>
-                    </div>
-                    
-                    <div class="btn-container">
-                        <button class="btn-copy" onclick="copyCode()">
-                            📋 Copy Code with Prefix
-                        </button>
-                        <button class="btn-close" onclick="window.close()">
-                            Close Window
-                        </button>
-                    </div>
-                    
-                    <div class="success-msg" id="successMsg">
-                        ✓ Code copied! Now paste it in your bot chat.
-                    </div>
-                </div>
-                
-                <script>
-                    function copyCode() {
-                        const codeElement = document.getElementById('authCode');
-                        const code = codeElement.textContent;
-                        const fullCommand = 'auth:' + code;
-                        
-                        // Try modern clipboard API first
-                        if (navigator.clipboard && navigator.clipboard.writeText) {
-                            navigator.clipboard.writeText(fullCommand)
-                                .then(() => {
-                                    showSuccess();
-                                })
-                                .catch(err => {
-                                    console.error('Clipboard API failed:', err);
-                                    fallbackCopy(fullCommand);
-                                });
-                        } else {
-                            fallbackCopy(fullCommand);
-                        }
-                    }
-                    
-                    function fallbackCopy(text) {
-                        const textArea = document.createElement('textarea');
-                        textArea.value = text;
-                        textArea.style.position = 'fixed';
-                        textArea.style.left = '-999999px';
-                        textArea.style.top = '-999999px';
-                        document.body.appendChild(textArea);
-                        textArea.focus();
-                        textArea.select();
-                        
-                        try {
-                            const successful = document.execCommand('copy');
-                            if (successful) {
-                                showSuccess();
-                            } else {
-                                alert('Copy failed. Please manually copy: ' + text);
-                            }
-                        } catch (err) {
-                            console.error('Fallback copy failed:', err);
-                            alert('Please manually copy the code:\\n\\n' + text);
-                        }
-                        
-                        document.body.removeChild(textArea);
-                    }
-                    
-                    function showSuccess() {
-                        const successMsg = document.getElementById('successMsg');
-                        successMsg.style.display = 'block';
-                        
-                        setTimeout(() => {
-                            successMsg.style.display = 'none';
-                        }, 3000);
-                    }
-                    
-                    // Auto-select code on page load for easy copying
-                    window.addEventListener('load', () => {
-                        const codeElement = document.getElementById('authCode');
-                        const selection = window.getSelection();
-                        const range = document.createRange();
-                        range.selectNodeContents(codeElement);
-                        selection.removeAllRanges();
-                        selection.addRange(range);
-                        
-                        console.log('Auth code ready. State:', '${
-                          state || "none"
-                        }');
-                    });
-                </script>
-            </body>
-        </html>
-    `;
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sign-in Failed</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      min-height: 100vh;
+      margin: 0;
+      background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+    }
+    .container {
+      background: white;
+      padding: 40px;
+      border-radius: 12px;
+      box-shadow: 0 10px 40px rgba(0,0,0,0.2);
+      text-align: center;
+      max-width: 400px;
+    }
+    .icon { font-size: 64px; margin-bottom: 20px; }
+    h1 { color: #2d3748; margin: 0 0 10px 0; }
+    p { color: #4a5568; line-height: 1.6; }
+    .error { background: #fee; padding: 12px; border-radius: 6px; margin: 20px 0; color: #c53030; font-size: 14px; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="icon">❌</div>
+    <h1>Sign-in Failed</h1>
+    <div class="error">${errorMessage}</div>
+    <p>Please close this window and try again from Teams.</p>
+  </div>
+</body>
+</html>
+  `;
 }
+
+// ============================================================================
+// START SERVER
+// ============================================================================
+
+app.listen(PORT, () => {
+  console.log("\n" + "=".repeat(60));
+  console.log("🤖 Meeting Scheduler Bot with Manual OAuth");
+  console.log("=".repeat(60));
+  console.log(`📍 Port: ${PORT}`);
+  console.log(`💬 Messages: ${BASE_URL}/api/messages`);
+  console.log(`🔐 OAuth Callback: ${REDIRECT_URI}`);
+  console.log("=".repeat(60) + "\n");
+});
