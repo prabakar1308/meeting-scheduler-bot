@@ -34,6 +34,27 @@ const REDIRECT_URI = `${BASE_URL}/api/oauth/callback`;
 
 const SCOPES = "User.Read Calendars.ReadWrite offline_access";
 
+console.log("\n🔍 CREDENTIAL DEBUG:");
+console.log("   App ID:", MICROSOFT_APP_ID);
+console.log("   App ID Length:", MICROSOFT_APP_ID?.length);
+console.log(
+  "   Password:",
+  MICROSOFT_APP_PASSWORD
+    ? `${MICROSOFT_APP_PASSWORD.substring(
+        0,
+        4
+      )}...${MICROSOFT_APP_PASSWORD.substring(
+        MICROSOFT_APP_PASSWORD.length - 4
+      )} (length: ${MICROSOFT_APP_PASSWORD.length})`
+    : "NOT SET"
+);
+console.log(
+  "   App ID format valid:",
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+    MICROSOFT_APP_ID
+  )
+);
+
 console.log("\n🔧 OAuth Configuration:");
 console.log("   App ID:", MICROSOFT_APP_ID ? "✓ Configured" : "✗ MISSING");
 console.log(
